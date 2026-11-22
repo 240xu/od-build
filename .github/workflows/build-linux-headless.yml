@@ -47,6 +47,14 @@ jobs:
           ref: ${{ inputs.upstream_ref }}
           fetch-depth: 1
 
+      # 额外拉一份本 harness 仓库（补丁脚本在 scripts/ 下，不在一游 checkout 里）
+      - name: Checkout build harness
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: .ci
+          fetch-depth: 1
+
       - name: Show upstream version
         run: |
           set -euo pipefail
@@ -81,7 +89,7 @@ jobs:
       # monorepo 文件 → next.config 加载失败 → web sidecar exit 1 → headless 起不来。
       # 补丁逻辑见 scripts/patch-cms-fingerprint.py，幂等（上游合并后自动跳过）。
       - name: Patch web next.config (CMS fingerprint, PR #8538)
-        run: python3 scripts/patch-cms-fingerprint.py
+        run: python3 .ci/scripts/patch-cms-fingerprint.py
 
       # 用 dir 目标组装 payload —— 不产出 AppImage，因此不引入 Electron 打包
       - name: Assemble payload (target=dir)
