@@ -41,9 +41,13 @@ concurrency:
 
 env:
   UPSTREAM: nexu-io/open-design
-  # 关键：onnxruntime 的 install 钩子会去下载 CUDA EP 二进制，
+  # 关键 1：onnxruntime 的 install 钩子会去下载 CUDA EP 二进制，
   # 在受限网络下返回 404 直接失败。这个官方开关让它跳过。
   ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+  # 关键 2：--containerized 会在 electronuserland/builder 容器里跑 pnpm install，
+  # 没有 TTY 时 pnpm 拒绝清理 node_modules 目录（实测 ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY，
+  # 导致 docker build exit 1）。CI=true 让它直接放行。
+  CI: "true"
 
 jobs:
   build:
