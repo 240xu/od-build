@@ -77,10 +77,16 @@ jobs:
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-          # 取该 ref 的版本号
+          # 取该 ref 的版本号。
+          # 拿不到就**失败**，绝不回落到 0.0.0 —— 否则会静默产出一个
+          # v0.0.0-stable 的假 release，还污染 skip 判断。
           ver=$(gh api "repos/$UPSTREAM/contents/package.json?ref=$ref" \
                 -H "Accept: application/vnd.github.raw" 2>/dev/null \
-              | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null || echo "0.0.0")
+              | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null || true)
+          if [ -z "${ver:-}" ] || [ "$ver" = "null" ]; then
+            echo "::error::cannot resolve upstream version for ref=$ref"
+            exit 1
+          fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
           ns="${INPUT_NS:-stable}"
