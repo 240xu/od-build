@@ -1,0 +1,351 @@
+name: Build OpenDesign Linux (headless + desktop)
+
+# 产出两种 Linux 产物，同属一个 release：
+#   od-headless-<ns>.tar.gz     纯 headless：daemon + web，无 Electron
+#   Open Design-<ns>.AppImage   桌面版（含 Electron）
+#
+# 触发：
+#   1) 手动 workflow_dispatch
+#   2) 定时（每 6 小时）检查上游是否有新 tag/commit → 有则自动构建
+#   3) 上游仓库 release 发布（repository_dispatch，需在 fork 侧配置）
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "上游 ref（分支/tag/commit）"
+        required: false
+        default: ""
+      namespace:
+        description: "namespace"
+        required: false
+        default: stable
+      build_headless:
+        description: "构建 headless"
+        type: boolean
+        required: false
+        default: true
+      build_desktop:
+        description: "构建桌面版 AppImage"
+        type: boolean
+        required: false
+        default: true
+  schedule:
+    - cron: "17 */6 * * *"   # 每 6 小时的第 17 分钟
+  repository_dispatch:
+    types: [upstream-release]
+
+concurrency:
+  group: od-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: nexu-io/open-design
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+  CI: "true"
+
+jobs:
+  # ── 1. 解析上游 ref + 判断是否需要构建 ──────────────────────────────
+  resolve:
+    name: Resolve upstream
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+      version: ${{ steps.pick.outputs.version }}
+      should_build: ${{ steps.pick.outputs.should_build }}
+      headless: ${{ steps.pick.outputs.headless }}
+      desktop: ${{ steps.pick.outputs.desktop }}
+      ns: ${{ steps.pick.outputs.ns }}
+    steps:
+      - name: Pick ref and decide
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.upstream_ref }}
+          INPUT_NS: ${{ inputs.namespace }}
+          INPUT_HEADLESS: ${{ inputs.build_headless }}
+          INPUT_DESKTOP: ${{ inputs.build_desktop }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          ref="${INPUT_REF:-}"
+          if [ -z "$ref" ]; then
+            # 取上游最新 release tag；没有 release 就退回 main
+            ref=$(gh api "repos/$UPSTREAM/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+            [ -n "$ref" ] || ref=main
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+          # 取该 ref 的版本号
+          ver=$(gh api "repos/$UPSTREAM/contents/package.json?ref=$ref" \
+                -H "Accept: application/vnd.github.raw" 2>/dev/null \
+              | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null || echo "0.0.0")
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+          ns="${INPUT_NS:-stable}"
+          echo "ns=$ns" >> "$GITHUB_OUTPUT"
+
+          # 构建目标（手动触发按输入；定时/dispatch 默认全建）
+          headless="${INPUT_HEADLESS:-true}"
+          desktop="${INPUT_DESKTOP:-true}"
+          [ "$EVENT" = "workflow_dispatch" ] || { headless=true; desktop=true; }
+          echo "headless=$headless" >> "$GITHUB_OUTPUT"
+          echo "desktop=$desktop" >> "$GITHUB_OUTPUT"
+
+          # 定时触发时：若上游版本已在本仓库 release 中存在，则跳过
+          if [ "$EVENT" = "schedule" ]; then
+            existing=$(gh api "repos/${{ github.repository }}/releases" --jq '.[].tag_name' 2>/dev/null | grep -c "v$ver" || true)
+            if [ "$existing" != "0" ]; then
+              echo "上游 $ver 已有 release，跳过"; echo "should_build=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "上游 $ver 无 release，开始构建"; echo "should_build=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── 2. headless 产物 ────────────────────────────────────────────────
+  headless:
+    name: Build headless bundle
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true' && needs.resolve.outputs.headless == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: nexu-io/open-design
+          ref: ${{ needs.resolve.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Checkout build harness
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: .ci
+          fetch-depth: 1
+
+      - name: Setup pnpm 10.33.2
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build web static export
+        run: pnpm --filter @open-design/web build
+
+      - name: Patch web next.config (CMS fingerprint, PR #8538)
+        run: python3 .ci/scripts/patch-cms-fingerprint.py
+
+      - name: Assemble payload (target=dir)
+        env:
+          NS: ${{ needs.resolve.outputs.ns }}
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/od-out"
+          rm -rf "$out_dir"; mkdir -p "$out_dir"
+          pnpm exec tools-pack linux build \
+            --dir "$out_dir" \
+            --namespace "$NS" \
+            --portable \
+            --to dir \
+            --json | tee "$RUNNER_TEMP/build.json"
+
+      - name: Patch web/out into assembled
+        env:
+          NS: ${{ needs.resolve.outputs.ns }}
+        run: |
+          set -euo pipefail
+          web="$RUNNER_TEMP/od-out/out/linux/namespaces/$NS/assembled/app/node_modules/@open-design/web"
+          [ -d "$web" ] || { echo "web package not found: $web"; exit 1; }
+          if [ ! -d "$web/out" ]; then cp -a apps/web/out "$web/out"; fi
+          test -d "$web/out"
+
+      - name: Verify headless prerequisites
+        env:
+          NS: ${{ needs.resolve.outputs.ns }}
+        run: |
+          set -euo pipefail
+          nsdir="$RUNNER_TEMP/od-out/out/linux/namespaces/$NS"
+          fail=0
+          chk() { if [ -e "$1" ]; then echo "OK   $1"; else echo "MISS $1"; fail=1; fi; }
+          chk "$nsdir/assembled/app/node_modules/@open-design/packaged/dist/headless.mjs"
+          chk "$nsdir/assembled/app/node_modules/@open-design/daemon/dist/sidecar/index.js"
+          chk "$nsdir/assembled/app/node_modules/@open-design/web/out/index.html"
+          chk "$nsdir/resources/open-design/bin/node"
+          [ -d "$nsdir/assembled/app/node_modules/electron" ] && { echo "UNEXPECTED electron"; fail=1; } || echo "OK   no electron"
+          grep -q hasCmsHostReleaseInputs "$nsdir/assembled/app/node_modules/@open-design/web/next.config.ts" \
+            && echo "OK   next.config patched" || { echo "FAIL next.config patch"; fail=1; }
+          [ "$fail" = "0" ] || exit 1
+
+      - name: Generate launcher
+        env:
+          NS: ${{ needs.resolve.outputs.ns }}
+        run: python3 .ci/scripts/make-launcher.py "$NS" dist/launcher
+
+      - name: Package headless bundle
+        env:
+          NS: ${{ needs.resolve.outputs.ns }}
+        run: |
+          set -euo pipefail
+          nsdir="$RUNNER_TEMP/od-out/out/linux/namespaces/$NS"
+          stage="$RUNNER_TEMP/stage"
+          rm -rf "$stage"
+          mkdir -p "$stage/out/linux/namespaces/$NS" "$stage/launcher" "$stage/runtime/linux"
+          cp -a "$nsdir/assembled" "$stage/out/linux/namespaces/$NS/"
+          cp -a "$nsdir/resources" "$stage/out/linux/namespaces/$NS/"
+          cp -a "dist/launcher/open-design-headless-$NS" "$stage/launcher/"
+          python3 .ci/scripts/make-readme.py "$NS" "$stage/README.md"
+          tar -C "$stage" -czf "dist/od-headless-$NS.tar.gz" .
+          ls -lh dist/
+
+      - name: Smoke-run launcher
+        env:
+          NS: ${{ needs.resolve.outputs.ns }}
+        run: python3 .ci/scripts/smoke-headless.py "dist/od-headless-$NS.tar.gz" "$NS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: headless-${{ needs.resolve.outputs.ns }}
+          path: dist/od-headless-${{ needs.resolve.outputs.ns }}.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── 3. 桌面版 AppImage ──────────────────────────────────────────────
+  desktop:
+    name: Build desktop AppImage
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true' && needs.resolve.outputs.desktop == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: nexu-io/open-design
+          ref: ${{ needs.resolve.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Checkout build harness
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: .ci
+          fetch-depth: 1
+
+      - name: Setup pnpm 10.33.2
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build web static export
+        run: pnpm --filter @open-design/web build
+
+      # 桌面版走 AppImage，必须修 CMS 探测，否则首次启动同样崩在 next.config
+      - name: Patch web next.config (CMS fingerprint, PR #8538)
+        run: python3 .ci/scripts/patch-cms-fingerprint.py
+
+      - name: Build AppImage (native, not containerized)
+        env:
+          NS: ${{ needs.resolve.outputs.ns }}
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/od-out"
+          rm -rf "$out_dir"; mkdir -p "$out_dir"
+          pnpm exec tools-pack linux build \
+            --dir "$out_dir" \
+            --namespace "$NS" \
+            --portable \
+            --to appimage \
+            --json | tee "$RUNNER_TEMP/build.json"
+          node -e 'const fs=require("fs");JSON.parse(fs.readFileSync(process.argv[1],"utf8"));console.log("build.json OK")' "$RUNNER_TEMP/build.json"
+
+      - name: Collect AppImage
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "$RUNNER_TEMP/od-out" -name '*.AppImage' -exec cp -v {} dist/ \;
+          ls -lh dist/
+          test -n "$(ls -A dist)" || { echo "no AppImage produced"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ needs.resolve.outputs.ns }}
+          path: dist/*.AppImage
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── 4. 汇总发布 ────────────────────────────────────────────────────
+  release:
+    name: Publish release
+    needs: [resolve, headless, desktop]
+    if: |
+      always() &&
+      needs.resolve.outputs.should_build == 'true' &&
+      (needs.headless.result == 'success' || needs.desktop.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List
+        run: ls -lh dist/
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ needs.resolve.outputs.version }}-${{ needs.resolve.outputs.ns }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          REF: ${{ needs.resolve.outputs.ref }}
+          REPO: ${{ github.repository }}
+          HEADLESS: ${{ needs.headless.result }}
+          DESKTOP: ${{ needs.desktop.result }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<MD
+          OpenDesign Linux build for upstream \`$REF\` (version $VERSION).
+
+          | artifact | contents |
+          |---|---|
+          | \`od-headless-*.tar.gz\` | headless runtime — daemon + web, **no Electron** ($HEADLESS) |
+          | \`*.AppImage\` | desktop build, includes Electron ($DESKTOP) |
+
+          Both are built with pnpm 10.33.2 / Node 24 on ubuntu-latest,
+          with \`ONNXRUNTIME_NODE_INSTALL_CUDA=skip\` and the upstream
+          PR #8538 CMS-fingerprint patch applied (see repo README).
+          MD
+          )
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$REPO" --clobber
+            echo "updated existing release $TAG"
+          else
+            gh release create "$TAG" dist/* --repo "$REPO" \
+              --title "OpenDesign Linux $VERSION" --notes "$notes"
+            echo "created release $TAG"
+          fi
