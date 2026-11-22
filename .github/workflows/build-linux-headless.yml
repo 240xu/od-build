@@ -144,7 +144,7 @@ jobs:
           # Open Design headless launcher — namespace: NSNAME
           # 由 od-build CI 依官方模板生成。ROOT 为本 bundle 解压目录，
           # 可用 OD_ROOT 覆盖。
-          ROOT="${OD_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+          ROOT="${OD_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
           RES="$ROOT/out/linux/namespaces/NSNAME/resources/open-design"
           ENTRY="$ROOT/out/linux/namespaces/NSNAME/assembled/app/node_modules/@open-design/packaged/dist/headless.mjs"
           OPEN_DESIGN_AMR_ENDPOINT_BINDING='' \
@@ -219,6 +219,13 @@ jobs:
           tail -40 "$D/run.log" || true
           if grep -qE "Cannot find module|ERR_MODULE_NOT_FOUND|failed to resolve" "$D/run.log"; then
             echo "FAIL: launcher cannot load modules"; exit 1
+          fi
+          # exec 失败（如 ROOT 算错导致 node 路径不存在）必须算失败，不能放过
+          if grep -qE "not found|No such file or directory|Permission denied" "$D/run.log"; then
+            echo "FAIL: launcher exec error"; exit 1
+          fi
+          if [ "$code" = "127" ]; then
+            echo "FAIL: launcher exit 127 (command not found)"; exit 1
           fi
           echo "SMOKE PASS"
 
