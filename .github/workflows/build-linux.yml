@@ -35,13 +35,21 @@ on:
         type: boolean
         required: false
         default: true
+      force:
+        description: "忽略「已有同版本 release」强制重建（修复已损坏的 release 用）"
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: "17 */6 * * *"
   repository_dispatch:
     types: [upstream-release]
 
 concurrency:
-  group: od-linux-${{ github.ref }}-${{ github.event_name }}
+  # 不带 event_name —— schedule 与 repository_dispatch 的 github.ref 都是
+  # refs/heads/main，若按事件名分组就不互斥，两个 run 会并行构建同一版本、
+  # 撞同一个 release tag（422 already_exists 或 --clobber 静默替换资产）。
+  group: od-linux-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -56,6 +64,7 @@ jobs:
     outputs:
       ref: ${{ steps.pick.outputs.ref }}
       version: ${{ steps.pick.outputs.version }}
+      tag: ${{ steps.pick.outputs.tag }}
       should_build: ${{ steps.pick.outputs.should_build }}
       headless: ${{ steps.pick.outputs.headless }}
       desktop: ${{ steps.pick.outputs.desktop }}
@@ -69,6 +78,7 @@ jobs:
           INPUT_NS: ${{ inputs.namespace }}
           INPUT_HEADLESS: ${{ inputs.build_headless }}
           INPUT_DESKTOP: ${{ inputs.build_desktop }}
+          INPUT_FORCE: ${{ inputs.force }}
           EVENT: ${{ github.event_name }}
           PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
           REPO: ${{ github.repository }}
@@ -108,6 +118,18 @@ jobs:
           fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
+          # tag 形态：纯 tag ref → v<ver>；其它（main/分支/commit）→ v<ver>-main.<sha7>
+          case "$ref" in
+            open-design-v"$ver") tag="v$ver" ;;
+            *) : ;;
+          esac
+          if [ -z "${tag:-}" ]; then
+            sha7=$(gh api "repos/$UPSTREAM/commits/$ref" --jq '.sha' 2>/dev/null | cut -c1-7 || true)
+            case "$sha7" in ""|*'{'*) sha7="unknown" ;; esac
+            tag="v${ver}-main.${sha7}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
           ns="${INPUT_NS:-stable}"
           echo "ns=$ns" >> "$GITHUB_OUTPUT"
 
@@ -118,23 +140,23 @@ jobs:
           echo "headless=$headless" >> "$GITHUB_OUTPUT"
           echo "desktop=$desktop" >> "$GITHUB_OUTPUT"
 
-          # ── 4. 定时触发时按精确 tag 判重 ─────────────────────────────
+          # ── 4. 所有事件都按精确 tag 判重 ─────────────────────────────
           # 先把列表落变量再 grep，避免 pipefail + SIGPIPE 把「有」误判成「无」。
-          if [ "$EVENT" = "schedule" ]; then
-            want="v${ver}"
-            legacy="v${ver}-${ns}"
-            tags=$(gh api "repos/$REPO/releases?per_page=100" --jq '.[].tag_name' 2>/dev/null || true)
-            hit=0
-            printf '%s\n' "$tags" | grep -Fxq "$want"   && hit=1
-            printf '%s\n' "$tags" | grep -Fxq "$legacy" && hit=1
-            if [ "$hit" = "1" ]; then
-              echo "已有 release $want（或旧格式 $legacy），跳过"
-              echo "should_build=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "无 release $want，开始构建"
-              echo "should_build=true" >> "$GITHUB_OUTPUT"
-            fi
+          # 只有手动触发且显式 force=true 才跳过判重（用于修复已损坏的 release）。
+          want="$tag"
+          legacy="v${ver}-${ns}"
+          tags=$(gh api "repos/$REPO/releases?per_page=100" --jq '.[].tag_name' 2>/dev/null || true)
+          hit=0
+          printf '%s\n' "$tags" | grep -Fxq "$want"   && hit=1
+          printf '%s\n' "$tags" | grep -Fxq "$legacy" && hit=1
+          if [ "${INPUT_FORCE:-false}" = "true" ]; then
+            echo "force=true，忽略已有 release，强制构建"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$hit" = "1" ]; then
+            echo "已有 release $want（或旧格式 $legacy），跳过"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
+            echo "无 release $want，开始构建"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -158,6 +180,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository }}
+          # 固定到触发本次 run 的那个 commit —— 否则重跑旧 workflow 会拿到
+          # 新版 scripts/，workflow 与脚本混版本。
+          ref: ${{ github.sha }}
           path: .ci
           fetch-depth: 1
 
@@ -259,7 +284,7 @@ jobs:
         with:
           name: headless-${{ needs.resolve.outputs.ns }}
           path: dist/od-headless-${{ needs.resolve.outputs.ns }}.tar.gz
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: error
 
   desktop:
@@ -282,6 +307,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository }}
+          # 固定到触发本次 run 的那个 commit —— 否则重跑旧 workflow 会拿到
+          # 新版 scripts/，workflow 与脚本混版本。
+          ref: ${{ github.sha }}
           path: .ci
           fetch-depth: 1
 
@@ -332,7 +360,7 @@ jobs:
         with:
           name: desktop-${{ needs.resolve.outputs.ns }}
           path: dist/*.AppImage
-          retention-days: 7
+          retention-days: 30
           if-no-files-found: error
 
   release:
@@ -360,7 +388,10 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v${{ needs.resolve.outputs.version }}
+          # tag 必须能溯源：只有上游 ref 是 `open-design-v<ver>` 这种纯 tag 形态时
+          # 才用 `v<ver>`；否则（main / 分支 / commit）加 `-main.<sha7>` 后缀，
+          # 避免 main 构建与 tag 构建撞同一个 tag、把已发布资产换成不同来源的内容。
+          TAG: ${{ needs.resolve.outputs.tag }}
           VERSION: ${{ needs.resolve.outputs.version }}
           REF: ${{ needs.resolve.outputs.ref }}
           NS: ${{ needs.resolve.outputs.ns }}
@@ -384,6 +415,10 @@ jobs:
           MD
           )
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # --clobber 只替换同名资产，不碰 title/notes；
+            # 重跑同版本时 release 页会留着旧说明，所以显式 edit 一次。
+            gh release edit "$TAG" --repo "$REPO" \
+              --title "OpenDesign Linux $VERSION" --notes "$notes"
             gh release upload "$TAG" dist/* --repo "$REPO" --clobber
             echo "updated existing release $TAG"
           else
