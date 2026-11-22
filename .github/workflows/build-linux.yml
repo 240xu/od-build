@@ -1,0 +1,161 @@
+name: Build OpenDesign Linux (AppImage + headless)
+
+# 目的：在 GitHub 的干净环境里构建 OpenDesign 的 Linux 产物，
+# 绕开本地两个硬坑（onnxruntime CUDA 二进制 404、pnpm 版本被 engines 拒绝）。
+#
+# 产物：
+#   - Open Design-<ns>.AppImage   桌面版（含 Electron）
+#   - headless 打包目录            daemon + web，无 Electron（本机实际使用形态）
+#
+# 用法：Actions → Build OpenDesign Linux → Run workflow
+#       可指定上游 ref（分支/tag/commit），默认 main。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "上游 ref（分支/tag/commit），默认 main"
+        required: false
+        default: main
+      target:
+        description: "构建目标"
+        required: true
+        type: choice
+        default: appimage
+        options:
+          - appimage
+          - dir
+      containerized:
+        description: "在 electronuserland/builder 镜像内构建（更宽 glibc 兼容，官方发行用这个）"
+        required: true
+        type: boolean
+        default: true
+      mksquashfs_threads:
+        description: "AppImage 压缩线程数（低配机器可调小）"
+        required: false
+        default: "4"
+
+concurrency:
+  group: od-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM: nexu-io/open-design
+  # 关键：onnxruntime 的 install 钩子会去下载 CUDA EP 二进制，
+  # 在受限网络下返回 404 直接失败。这个官方开关让它跳过。
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+
+jobs:
+  build:
+    name: Build (${{ inputs.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ inputs.upstream_ref }}
+          fetch-depth: 1
+
+      - name: Show upstream version
+        run: |
+          set -euo pipefail
+          node -e 'const p=require("./package.json");console.log("name:",p.name,"version:",p.version);console.log("engines:",JSON.stringify(p.engines),"pm:",p.packageManager)'
+          git log -1 --format='commit %h  %ci  %s'
+
+      - name: Setup pnpm (pinned by upstream engines)
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # web 静态导出：headless 运行时需要 @open-design/web/out。
+      # 上游 apps/web/package.json 的 files 不含 out，必须在这里先产出再打包。
+      - name: Build web static export
+        run: pnpm --filter @open-design/web build
+
+      - name: Verify web export
+        run: |
+          set -euo pipefail
+          test -d apps/web/out || { echo "apps/web/out missing"; exit 1; }
+          du -sh apps/web/out
+          ls apps/web/out | head -8
+
+      - name: Build Linux artifact
+        env:
+          TARGET: ${{ inputs.target }}
+          CONTAINERIZED: ${{ inputs.containerized }}
+        run: |
+          set -euo pipefail
+          out_dir="$RUNNER_TEMP/od-out"
+          rm -rf "$out_dir"; mkdir -p "$out_dir"
+          args=( exec tools-pack linux build
+                 --dir "$out_dir"
+                 --namespace stable
+                 --portable
+                 --to "$TARGET"
+                 --json )
+          if [ "$CONTAINERIZED" = "true" ]; then args+=( --containerized ); fi
+          pnpm "${args[@]}" | tee "$RUNNER_TEMP/build.json"
+          node -e 'const fs=require("fs");JSON.parse(fs.readFileSync(process.argv[1],"utf8"));console.log("build.json OK")' "$RUNNER_TEMP/build.json"
+
+      - name: Patch web/out into assembled (headless 必需)
+        run: |
+          set -euo pipefail
+          # assembled 里 @open-design/web 只有源码与 .next，没有 out。
+          # headless 的 web sidecar 走 Next 静态导出，缺 out 会起不来。
+          for app in "$RUNNER_TEMP"/od-out/linux/namespaces/*/assembled/app; do
+            web="$app/node_modules/@open-design/web"
+            [ -d "$web" ] || continue
+            if [ ! -d "$web/out" ]; then
+              cp -a apps/web/out "$web/out"
+              echo "patched: $web/out"
+            fi
+          done
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "$RUNNER_TEMP/od-out" -name '*.AppImage' -exec cp -v {} dist/ \;
+          if [ -d "$RUNNER_TEMP/od-out/linux/namespaces" ]; then
+            ns=$(ls "$RUNNER_TEMP/od-out/linux/namespaces" | head -1)
+            # headless 完整运行集：assembled + resources + runtime
+            tar -C "$RUNNER_TEMP/od-out/linux/namespaces/$ns" \
+                -czf "dist/od-headless-$ns.tar.gz" \
+                assembled resources 2>/dev/null || true
+          fi
+          ls -lh dist || true
+          du -sh dist || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: od-linux-${{ inputs.target }}-${{ inputs.upstream_ref }}
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Build summary"
+            echo ""
+            echo "- upstream ref: \`${{ inputs.upstream_ref }}\`"
+            echo "- target: \`${{ inputs.target }}\`"
+            echo "- containerized: \`${{ inputs.containerized }}\`"
+            echo ""
+            echo '```'
+            ls -lh dist 2>/dev/null || echo "(no dist)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
