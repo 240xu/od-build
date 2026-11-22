@@ -77,6 +77,12 @@ jobs:
           test -d apps/web/out || { echo "apps/web/out missing"; exit 1; }
           du -sh apps/web/out
 
+      # 上游 main 缺 PR #8538：packaged web 会误判"有工作区源码"，去读不存在的
+      # monorepo 文件 → next.config 加载失败 → web sidecar exit 1 → headless 起不来。
+      # 补丁逻辑见 scripts/patch-cms-fingerprint.py，幂等（上游合并后自动跳过）。
+      - name: Patch web next.config (CMS fingerprint, PR #8538)
+        run: python3 scripts/patch-cms-fingerprint.py
+
       # 用 dir 目标组装 payload —— 不产出 AppImage，因此不引入 Electron 打包
       - name: Assemble payload (target=dir)
         env:
@@ -130,6 +136,15 @@ jobs:
             echo "OK   no electron (pure headless)"
           fi
           "$nsdir/resources/open-design/bin/node" -v
+          # 直接加载 next.config —— 这是 web sidecar 能否启动的前置条件
+          if ( cd "$nsdir/assembled/app" && NODE_ENV=production OD_WEB_PROD=1 \
+               "$nsdir/resources/open-design/bin/node" --experimental-strip-types \
+               -e "import('./node_modules/@open-design/web/next.config.ts').then(()=>console.log('next.config LOADED')).catch(e=>{console.error(e.message);process.exit(1)})" \
+               | grep -q "next.config LOADED" ); then
+            echo "OK   next.config loadable"
+          else
+            echo "FAIL next.config cannot load"; fail=1
+          fi
           [ "$fail" = "0" ] || exit 1
 
       # 生成 launcher：heredoc 内容统一缩进后 sed 去除，保持脚本首行为 shebang
