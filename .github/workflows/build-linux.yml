@@ -93,13 +93,16 @@ jobs:
           echo "headless=$headless" >> "$GITHUB_OUTPUT"
           echo "desktop=$desktop" >> "$GITHUB_OUTPUT"
 
-          # 定时触发时：若上游版本已在本仓库 release 中存在，则跳过
+          # 定时触发时：若上游版本已在本仓库 release 中存在，则跳过。
+          # 必须精确匹配 tag，不能用 grep 子串 —— `v0.27.2` 会误匹配
+          # `v0.27.21` / `v0.27.2-legacy`，导致漏构建。
           if [ "$EVENT" = "schedule" ]; then
-            existing=$(gh api "repos/${{ github.repository }}/releases" --jq '.[].tag_name' 2>/dev/null | grep -c "v$ver" || true)
-            if [ "$existing" != "0" ]; then
-              echo "上游 $ver 已有 release，跳过"; echo "should_build=false" >> "$GITHUB_OUTPUT"
+            want="v${ver}-${ns}"
+            if gh api "repos/${{ github.repository }}/releases" --jq '.[].tag_name' 2>/dev/null \
+               | grep -Fxq "$want"; then
+              echo "已有 release $want，跳过"; echo "should_build=false" >> "$GITHUB_OUTPUT"
             else
-              echo "上游 $ver 无 release，开始构建"; echo "should_build=true" >> "$GITHUB_OUTPUT"
+              echo "无 release $want，开始构建"; echo "should_build=true" >> "$GITHUB_OUTPUT"
             fi
           else
             echo "should_build=true" >> "$GITHUB_OUTPUT"
