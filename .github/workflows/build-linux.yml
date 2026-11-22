@@ -29,7 +29,7 @@ on:
         description: "在 electronuserland/builder 镜像内构建（更宽 glibc 兼容，官方发行用这个）"
         required: true
         type: boolean
-        default: true
+        default: false
       mksquashfs_threads:
         description: "AppImage 压缩线程数（低配机器可调小）"
         required: false
@@ -44,9 +44,12 @@ env:
   # 关键 1：onnxruntime 的 install 钩子会去下载 CUDA EP 二进制，
   # 在受限网络下返回 404 直接失败。这个官方开关让它跳过。
   ONNXRUNTIME_NODE_INSTALL_CUDA: skip
-  # 关键 2：--containerized 会在 electronuserland/builder 容器里跑 pnpm install，
-  # 没有 TTY 时 pnpm 拒绝清理 node_modules 目录（实测 ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY，
-  # 导致 docker build exit 1）。CI=true 让它直接放行。
+  # 关键 2：如果选了 --containerized，会在 electronuserland/builder 容器里跑
+  # pnpm install。该容器内无 TTY，pnpm 拒绝清理 node_modules（实测
+  # ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY → docker build exit 1）。
+  # 官方 buildDockerArgs 不传 CI 变量，宿主设了也没用，所以这条路当前是坏的
+  # （官方自己也在注释里写「containerized pnpm bootstrap is fixed and reviewed」
+  # 才重新启用 Linux lane）。默认改走非 containerized 原生构建。
   CI: "true"
 
 jobs:
