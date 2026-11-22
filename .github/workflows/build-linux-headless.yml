@@ -144,14 +144,13 @@ jobs:
             echo "OK   no electron (pure headless)"
           fi
           "$nsdir/resources/open-design/bin/node" -v
-          # 直接加载 next.config —— 这是 web sidecar 能否启动的前置条件
-          if ( cd "$nsdir/assembled/app" && NODE_ENV=production OD_WEB_PROD=1 \
-               "$nsdir/resources/open-design/bin/node" --experimental-strip-types \
-               -e "import('./node_modules/@open-design/web/next.config.ts').then(()=>console.log('next.config LOADED')).catch(e=>{console.error(e.message);process.exit(1)})" \
-               | grep -q "next.config LOADED" ); then
-            echo "OK   next.config loadable"
+          # next.config 是否已打上 CMS 修复（Node 无法直接 strip node_modules 下的 .ts，
+          # 真正可加载性由后面的 launcher smoke 覆盖）
+          if grep -q "hasCmsHostReleaseInputs" \
+               "$nsdir/assembled/app/node_modules/@open-design/web/next.config.ts"; then
+            echo "OK   next.config patched (CMS fingerprint)"
           else
-            echo "FAIL next.config cannot load"; fail=1
+            echo "FAIL next.config missing CMS fingerprint patch"; fail=1
           fi
           [ "$fail" = "0" ] || exit 1
 
@@ -243,12 +242,17 @@ jobs:
           if grep -qE "Cannot find module|ERR_MODULE_NOT_FOUND|failed to resolve" "$D/run.log"; then
             echo "FAIL: launcher cannot load modules"; exit 1
           fi
-          # exec 失败（如 ROOT 算错导致 node 路径不存在）必须算失败，不能放过
           if grep -qE "not found|No such file or directory|Permission denied" "$D/run.log"; then
             echo "FAIL: launcher exec error"; exit 1
           fi
           if [ "$code" = "127" ]; then
             echo "FAIL: launcher exit 127 (command not found)"; exit 1
+          fi
+          # 真实失败特征（本机复现过的两种死法）：
+          #   1) web sidecar: "Failed to load next.config" / ENOENT layout.tsx
+          #   2) 包装层: "sidecar bootstrap generation ... exited before a generation became ready"
+          if grep -qE "Failed to load next.config|ENOENT.*layout.tsx|exited before a generation became ready" "$D/run.log"; then
+            echo "FAIL: sidecar bootstrap failed"; tail -20 "$D/run.log"; exit 1
           fi
           echo "SMOKE PASS"
 
