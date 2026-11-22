@@ -98,7 +98,10 @@ jobs:
           NS: ${{ inputs.namespace }}
         run: |
           set -euo pipefail
-          web="$RUNNER_TEMP/od-out/linux/namespaces/$NS/assembled/app/node_modules/@open-design/web"
+          # 先把结构打出来，避免下次失败又要猜路径
+          echo '--- namespace dir tree (depth 3) ---'
+          find "$RUNNER_TEMP/od-out/out/linux/namespaces/$NS" -maxdepth 3 -type d | sort | head -40
+          web="$RUNNER_TEMP/od-out/out/linux/namespaces/$NS/assembled/app/node_modules/@open-design/web"
           [ -d "$web" ] || { echo "web package not found: $web"; exit 1; }
           if [ ! -d "$web/out" ]; then
             cp -a apps/web/out "$web/out"
@@ -113,7 +116,7 @@ jobs:
           NS: ${{ inputs.namespace }}
         run: |
           set -euo pipefail
-          nsdir="$RUNNER_TEMP/od-out/linux/namespaces/$NS"
+          nsdir="$RUNNER_TEMP/od-out/out/linux/namespaces/$NS"
           fail=0
           chk() { if [ -e "$1" ]; then echo "OK   $1"; else echo "MISS $1"; fail=1; fi; }
           chk "$nsdir/assembled/app/node_modules/@open-design/packaged/dist/headless.mjs"
@@ -161,7 +164,7 @@ jobs:
           NS: ${{ inputs.namespace }}
         run: |
           set -euo pipefail
-          nsdir="$RUNNER_TEMP/od-out/linux/namespaces/$NS"
+          nsdir="$RUNNER_TEMP/od-out/out/linux/namespaces/$NS"
           stage="$RUNNER_TEMP/stage"
           rm -rf "$stage"
           mkdir -p "$stage/out/linux/namespaces/$NS" "$stage/launcher" "$stage/runtime/linux"
