@@ -73,3 +73,52 @@ reparent 到 init），systemd 用 `Type=simple` 直接跑 launcher 会看到「
 | `scripts/make-launcher.py` | 生成官方风格 launcher（解析符号链接） |
 | `scripts/make-readme.py` | 生成 bundle 内 README |
 | `scripts/smoke-headless.py` | 解包实跑，只判真实失败特征 |
+
+---
+
+## 自动构建：为什么不靠 GitHub 原生事件
+
+**上游 release 事件无法直接触发本仓库的 workflow。** GitHub webhook 是仓库作用域的，
+不能跨仓库投递；在上游 org 装 webhook 需要该 org 的 admin 权限。`workflow_run` /
+`workflow_call` 也只在同一仓库内生效。
+
+所以「上游更新即自动构建」必须靠**外部调度器轮询**，本机（wuming）已落地
+systemd timer 方案：
+
+```sh
+# /etc/systemd/system/opendesign-watch.service + .timer（每 15 分钟）
+# 轮询 https://github.com/nexu-io/open-design/releases.atom（免鉴权、无限流）
+# 发现新 tag → POST /repos/240xu/opendesign-linux/dispatches
+#             {"event_type":"upstream-release","client_payload":{"tag":"open-design-v0.27.2"}}
+```
+
+`repository_dispatch` 收到 `client_payload.tag` 后会直接用它当 `upstream_ref`，
+不再自己去猜版本号。
+
+### 为什么 schedule 不是主通路
+
+GitHub 官方文档明确两条：
+
+1. 高负载时段 `schedule` 会延迟，**队列满时任务可能被丢弃**；
+2. **public 仓库 60 天无活动后，scheduled workflow 会被自动禁用**，且只有提交一次
+   改动 cron 的 commit 才会恢复。
+
+所以 `cron: 17 */6 * * *` 只作兜底，主通路是外部 timer + `workflow_dispatch` /
+`repository_dispatch`。
+
+## 版本号从哪来（重要）
+
+**上游 root `package.json` 的 `version` 不跟随 tag。** 实测：
+
+| tag | root package.json | apps/packaged/package.json |
+|---|---|---|
+| `open-design-v0.27.2` | **0.25.1** | 0.27.2 ✅ |
+| `open-design-v0.26.1` | **0.25.1** | 0.26.1 ✅ |
+
+所以 workflow 优先从 tag 正则提取版本号，取不到才读 `apps/packaged/package.json`，
+**绝不读 root**。读 root 会打出 `v0.25.1` 这种错 tag，且每 6 小时重复一次。
+
+## Release 只在两种产物都成功时发布
+
+`release` job 的条件是 `headless.result == 'success' && desktop.result == 'success'`。
+任一失败则**不发 release**，避免出现「声称两种产物但缺件」。

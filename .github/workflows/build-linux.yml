@@ -2,22 +2,27 @@ name: Build OpenDesign Linux (headless + desktop)
 
 # 产出两种 Linux 产物，同属一个 release：
 #   od-headless-<ns>.tar.gz     纯 headless：daemon + web，无 Electron
-#   Open Design-<ns>.AppImage   桌面版（含 Electron）
+#   Open.Design-<ns>.AppImage   桌面版（含 Electron）
 #
 # 触发：
-#   1) 手动 workflow_dispatch
-#   2) 定时（每 6 小时）检查上游是否有新 tag/commit → 有则自动构建
-#   3) 上游仓库 release 发布（repository_dispatch，需在 fork 侧配置）
+#   - workflow_dispatch（手动，主用）
+#   - schedule（每 6 小时兜底；GitHub 会在仓库 60 天无活动后静默禁用，
+#     且高负载时段可能丢任务 —— 所以它不是主通路）
+#   - repository_dispatch（由外部调度器投递，见 README「自动构建」一节）
+#
+# 注意：GitHub 的 webhook 是仓库作用域的，**不能跨仓库**把上游 release 事件
+# 投到本仓库。所以「上游更新即自动构建」必须靠本机/外部定时器轮询后调用
+# workflow_dispatch 或 dispatches API（已在 wuming 上用 systemd timer 落地）。
 
 on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "上游 ref（分支/tag/commit）"
+        description: "上游 ref（分支/tag/commit），留空=取最新 release tag"
         required: false
         default: ""
       namespace:
-        description: "namespace"
+        description: "namespace（产物目录名 + launcher stamp）"
         required: false
         default: stable
       build_headless:
@@ -31,12 +36,12 @@ on:
         required: false
         default: true
   schedule:
-    - cron: "17 */6 * * *"   # 每 6 小时的第 17 分钟
+    - cron: "17 */6 * * *"
   repository_dispatch:
     types: [upstream-release]
 
 concurrency:
-  group: od-linux-${{ github.ref }}
+  group: od-linux-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 env:
@@ -45,7 +50,6 @@ env:
   CI: "true"
 
 jobs:
-  # ── 1. 解析上游 ref + 判断是否需要构建 ──────────────────────────────
   resolve:
     name: Resolve upstream
     runs-on: ubuntu-latest
@@ -66,25 +70,40 @@ jobs:
           INPUT_HEADLESS: ${{ inputs.build_headless }}
           INPUT_DESKTOP: ${{ inputs.build_desktop }}
           EVENT: ${{ github.event_name }}
+          PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
-          ref="${INPUT_REF:-}"
+          # ── 1. 定 ref ────────────────────────────────────────────────
+          # gh api --jq 在 404 时会把错误 JSON 打到 **stdout**（实测 130 字节），
+          # `|| echo ""` 救不了。必须显式判空 + 判非 JSON。
+          ref="${INPUT_REF:-${PAYLOAD_TAG:-}}"
           if [ -z "$ref" ]; then
-            # 取上游最新 release tag；没有 release 就退回 main
-            ref=$(gh api "repos/$UPSTREAM/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
-            [ -n "$ref" ] || ref=main
+            cand=$(gh api "repos/$UPSTREAM/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+            case "$cand" in
+              ""|*'{'*|*'}') cand="" ;;
+            esac
+            ref="${cand:-main}"
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-          # 取该 ref 的版本号。
-          # 拿不到就**失败**，绝不回落到 0.0.0 —— 否则会静默产出一个
-          # v0.0.0-stable 的假 release，还污染 skip 判断。
-          ver=$(gh api "repos/$UPSTREAM/contents/package.json?ref=$ref" \
-                -H "Accept: application/vnd.github.raw" 2>/dev/null \
-              | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null || true)
-          if [ -z "${ver:-}" ] || [ "$ver" = "null" ]; then
-            echo "::error::cannot resolve upstream version for ref=$ref"
+          # ── 2. 定 version ────────────────────────────────────────────
+          # 上游 root package.json 的 version **不跟随 tag**（实测 v0.27.2 时
+          # root 仍是 0.25.1）。只有 apps/packaged/package.json 与 tag 严格一致，
+          # 所以优先从 tag 正则提取，取不到再读 packaged。
+          ver=""
+          if printf '%s' "$ref" | grep -qE '^open-design-v[0-9]+\.[0-9]+\.[0-9]+'; then
+            ver=$(printf '%s' "$ref" | sed -E 's/^open-design-v//')
+          fi
+          if [ -z "$ver" ]; then
+            ver=$(gh api "repos/$UPSTREAM/contents/apps/packaged/package.json?ref=$ref" \
+                  -H "Accept: application/vnd.github.raw" 2>/dev/null \
+                  | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null || true)
+            case "$ver" in ""|*'{'*) ver="" ;; esac
+          fi
+          if [ -z "$ver" ]; then
+            echo "::error::cannot resolve upstream version (ref=$ref)"
             exit 1
           fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
@@ -92,29 +111,33 @@ jobs:
           ns="${INPUT_NS:-stable}"
           echo "ns=$ns" >> "$GITHUB_OUTPUT"
 
-          # 构建目标（手动触发按输入；定时/dispatch 默认全建）
+          # ── 3. 定目标 ────────────────────────────────────────────────
           headless="${INPUT_HEADLESS:-true}"
           desktop="${INPUT_DESKTOP:-true}"
-          [ "$EVENT" = "workflow_dispatch" ] || { headless=true; desktop=true; }
+          if [ "$EVENT" != "workflow_dispatch" ]; then headless=true; desktop=true; fi
           echo "headless=$headless" >> "$GITHUB_OUTPUT"
           echo "desktop=$desktop" >> "$GITHUB_OUTPUT"
 
-          # 定时触发时：若上游版本已在本仓库 release 中存在，则跳过。
-          # 必须精确匹配 tag，不能用 grep 子串 —— `v0.27.2` 会误匹配
-          # `v0.27.21` / `v0.27.2-legacy`，导致漏构建。
+          # ── 4. 定时触发时按精确 tag 判重 ─────────────────────────────
+          # 先把列表落变量再 grep，避免 pipefail + SIGPIPE 把「有」误判成「无」。
           if [ "$EVENT" = "schedule" ]; then
-            want="v${ver}-${ns}"
-            if gh api "repos/${{ github.repository }}/releases" --jq '.[].tag_name' 2>/dev/null \
-               | grep -Fxq "$want"; then
-              echo "已有 release $want，跳过"; echo "should_build=false" >> "$GITHUB_OUTPUT"
+            want="v${ver}"
+            legacy="v${ver}-${ns}"
+            tags=$(gh api "repos/$REPO/releases?per_page=100" --jq '.[].tag_name' 2>/dev/null || true)
+            hit=0
+            printf '%s\n' "$tags" | grep -Fxq "$want"   && hit=1
+            printf '%s\n' "$tags" | grep -Fxq "$legacy" && hit=1
+            if [ "$hit" = "1" ]; then
+              echo "已有 release $want（或旧格式 $legacy），跳过"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
             else
-              echo "无 release $want，开始构建"; echo "should_build=true" >> "$GITHUB_OUTPUT"
+              echo "无 release $want，开始构建"
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
             fi
           else
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # ── 2. headless 产物 ────────────────────────────────────────────────
   headless:
     name: Build headless bundle
     needs: resolve
@@ -178,7 +201,7 @@ jobs:
           set -euo pipefail
           web="$RUNNER_TEMP/od-out/out/linux/namespaces/$NS/assembled/app/node_modules/@open-design/web"
           [ -d "$web" ] || { echo "web package not found: $web"; exit 1; }
-          if [ ! -d "$web/out" ]; then cp -a apps/web/out "$web/out"; fi
+          [ -d "$web/out" ] || cp -a apps/web/out "$web/out"
           test -d "$web/out"
 
       - name: Verify headless prerequisites
@@ -193,9 +216,17 @@ jobs:
           chk "$nsdir/assembled/app/node_modules/@open-design/daemon/dist/sidecar/index.js"
           chk "$nsdir/assembled/app/node_modules/@open-design/web/out/index.html"
           chk "$nsdir/resources/open-design/bin/node"
-          [ -d "$nsdir/assembled/app/node_modules/electron" ] && { echo "UNEXPECTED electron"; fail=1; } || echo "OK   no electron"
-          grep -q hasCmsHostReleaseInputs "$nsdir/assembled/app/node_modules/@open-design/web/next.config.ts" \
-            && echo "OK   next.config patched" || { echo "FAIL next.config patch"; fail=1; }
+          if [ -d "$nsdir/assembled/app/node_modules/electron" ]; then
+            echo "UNEXPECTED electron in headless payload"; fail=1
+          else
+            echo "OK   no electron"
+          fi
+          if grep -q hasCmsHostReleaseInputs \
+               "$nsdir/assembled/app/node_modules/@open-design/web/next.config.ts"; then
+            echo "OK   next.config patched"
+          else
+            echo "FAIL next.config missing CMS patch"; fail=1
+          fi
           [ "$fail" = "0" ] || exit 1
 
       - name: Generate launcher
@@ -231,7 +262,6 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # ── 3. 桌面版 AppImage ──────────────────────────────────────────────
   desktop:
     name: Build desktop AppImage
     needs: resolve
@@ -271,7 +301,7 @@ jobs:
       - name: Build web static export
         run: pnpm --filter @open-design/web build
 
-      # 桌面版走 AppImage，必须修 CMS 探测，否则首次启动同样崩在 next.config
+      # 桌面版同样需要这个补丁，否则首次启动就崩在 next.config
       - name: Patch web next.config (CMS fingerprint, PR #8538)
         run: python3 .ci/scripts/patch-cms-fingerprint.py
 
@@ -305,14 +335,15 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # ── 4. 汇总发布 ────────────────────────────────────────────────────
   release:
     name: Publish release
     needs: [resolve, headless, desktop]
+    # 只有两个目标**都**成功才发布 —— 否则 release 会缺件，违背「两种产物」的承诺。
     if: |
-      always() &&
+      !cancelled() &&
       needs.resolve.outputs.should_build == 'true' &&
-      (needs.headless.result == 'success' || needs.desktop.result == 'success')
+      needs.headless.result == 'success' &&
+      needs.desktop.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -329,25 +360,27 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: v${{ needs.resolve.outputs.version }}-${{ needs.resolve.outputs.ns }}
+          TAG: v${{ needs.resolve.outputs.version }}
           VERSION: ${{ needs.resolve.outputs.version }}
           REF: ${{ needs.resolve.outputs.ref }}
+          NS: ${{ needs.resolve.outputs.ns }}
           REPO: ${{ github.repository }}
-          HEADLESS: ${{ needs.headless.result }}
-          DESKTOP: ${{ needs.desktop.result }}
         run: |
           set -euo pipefail
           notes=$(cat <<MD
           OpenDesign Linux build for upstream \`$REF\` (version $VERSION).
 
-          | artifact | contents |
+          | asset | contents |
           |---|---|
-          | \`od-headless-*.tar.gz\` | headless runtime — daemon + web, **no Electron** ($HEADLESS) |
-          | \`*.AppImage\` | desktop build, includes Electron ($DESKTOP) |
+          | \`od-headless-$NS.tar.gz\` | headless runtime — daemon + web, **no Electron** |
+          | \`*.AppImage\` | desktop build, includes Electron |
 
-          Both are built with pnpm 10.33.2 / Node 24 on ubuntu-latest,
-          with \`ONNXRUNTIME_NODE_INSTALL_CUDA=skip\` and the upstream
-          PR #8538 CMS-fingerprint patch applied (see repo README).
+          Built with pnpm 10.33.2 / Node 24 on ubuntu-latest, with
+          \`ONNXRUNTIME_NODE_INSTALL_CUDA=skip\` and the upstream PR #8538
+          CMS-fingerprint patch applied (see repo README).
+
+          > Asset names are sanitized by GitHub: spaces become dots, so the
+          > desktop file appears as \`Open.Design-$NS.AppImage\`.
           MD
           )
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
