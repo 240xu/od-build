@@ -50,6 +50,17 @@
    launcher 常被 `~/.local/bin` 软链调用，`dirname "$0"` 会给出错误目录，
    ROOT 算成 `~/.local`，然后 exec 一个不存在的 node。
 
+## 部署桌面版（AppImage）
+
+```sh
+# artifact 经 upload-artifact 中转后不保留可执行位，必须手加
+chmod +x Open.Design-stable.AppImage
+./Open.Design-stable.AppImage
+```
+
+> 注意 GitHub 会把资产名里的空格 sanitize 成点号：
+> `Open Design-stable.AppImage` → **`Open.Design-stable.AppImage`**。
+
 ## 部署 headless
 
 ```sh
