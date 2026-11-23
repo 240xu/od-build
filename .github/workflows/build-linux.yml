@@ -366,6 +366,35 @@ jobs:
           ls -lh dist/
           test -n "$(ls -A dist)" || { echo "no AppImage produced"; exit 1; }
 
+      # 只靠 `ls -A` 非空不够：截断的或没有 AppRun 的 AppImage 也会被发布。
+      # 用 `--appimage-extract` 解开并检查 AppRun + 关键 payload 真实存在。
+      - name: Verify AppImage integrity
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          imgs=(dist/*.AppImage)
+          [ "${#imgs[@]}" -ge 1 ] || { echo "no AppImage in dist"; exit 1; }
+          for img in "${imgs[@]}"; do
+            echo "--- verifying: $img ($(stat -c %s "$img") bytes) ---"
+            # ELF 头必须存在（AppImage 是自解压 ELF）
+            head -c 4 "$img" | od -An -tx1 | tr -d ' \n' | grep -q '7f454c46' \
+              || { echo "FAIL $img: not an ELF (truncated?)"; exit 1; }
+            work="$RUNNER_TEMP/verify-appimage"
+            rm -rf "$work"; mkdir -p "$work"
+            ( cd "$work" && "$GITHUB_WORKSPACE/$img" --appimage-extract >/dev/null 2>&1 ) \
+              || { echo "FAIL $img: --appimage-extract failed"; exit 1; }
+            test -x "$work/squashfs-root/AppRun" \
+              || { echo "FAIL $img: AppRun missing or not executable"; exit 1; }
+            # 桌面版必须有 electron 与 packaged 入口
+            test -e "$work/squashfs-root/resources/open-design/bin/node" \
+              || { echo "FAIL $img: bundled node missing"; exit 1; }
+            test -e "$work/squashfs-root/resources/app.asar" \
+              -o -e "$work/squashfs-root/resources/open-design" \
+              || { echo "FAIL $img: resources missing"; exit 1; }
+            echo "OK   $img"
+            rm -rf "$work"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ needs.resolve.outputs.ns }}
@@ -411,6 +440,8 @@ jobs:
           notes=$(cat <<MD
           OpenDesign Linux build for upstream \`$REF\` (version $VERSION).
 
+          Build harness commit: \`$GITHUB_SHA\`
+
           | asset | contents |
           |---|---|
           | \`od-headless-$NS.tar.gz\` | headless runtime — daemon + web, **no Electron** |
@@ -432,7 +463,10 @@ jobs:
             gh release upload "$TAG" dist/* --repo "$REPO" --clobber
             echo "updated existing release $TAG"
           else
+            # --target 固定到触发本次 run 的 commit：否则 tag 会指向创建时
+            # 默认分支的 HEAD，可能与真正构建内容不符。
             gh release create "$TAG" dist/* --repo "$REPO" \
+              --target "$GITHUB_SHA" \
               --title "OpenDesign Linux $VERSION" --notes "$notes"
-            echo "created release $TAG"
+            echo "created release $TAG (target=$GITHUB_SHA)"
           fi
