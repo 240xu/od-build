@@ -23,6 +23,17 @@
 定时任务会先比对 `240xu/opendesign-linux` 已有 release tag（`v<version>-<ns>`），
 已存在则跳过，避免重复构建。
 
+## 构建哪个 ref（重要）
+
+**`upstream_ref` 留空时只取上游最新 release tag，绝不回退 `main`。**
+
+原因：实测上游 `main` 与 release tag 会 **diverged**（`v0.27.2` 时 `main` 领先 24 个提交、
+tag 领先 13 个）。早期版本回退 `main` 的后果是：release 标着 `v0.27.2`，
+内容却是 `main` 的后续代码 —— 版本号与内容不对齐，排障时无法判断实际跑的是什么。
+
+想用 `main` 的新修复，**必须显式传** `upstream_ref=main`；此时产物 tag 会自动带
+`-main.<sha7>` 后缀（如 `v0.27.3-main.a1b2c3d`），便于溯源。
+
 ## 构建期已知坑（都已处理）
 
 1. **`--containerized` 不可用。** 官方 `buildDockerArgs` 不把 `CI` 传进容器，

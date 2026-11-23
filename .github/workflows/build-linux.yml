@@ -88,13 +88,23 @@ jobs:
           # ── 1. 定 ref ────────────────────────────────────────────────
           # gh api --jq 在 404 时会把错误 JSON 打到 **stdout**（实测 130 字节），
           # `|| echo ""` 救不了。必须显式判空 + 判非 JSON。
+          #
+          # **默认只构建正式 release tag，不回退 main。**
+          # 理由：main 与 tag 会 diverged（实测 v0.27.2 时 main 领先 24 / tag 领先 13），
+          # 回退 main 会导致「版本号写着 0.27.2、内容却是 main 的后续代码」——
+          # 版本号与内容不可对齐，排障时无法判断实际跑的是什么。
+          # 想用 main 的新修复，必须显式传 upstream_ref=main。
           ref="${INPUT_REF:-${PAYLOAD_TAG:-}}"
           if [ -z "$ref" ]; then
             cand=$(gh api "repos/$UPSTREAM/releases/latest" --jq '.tag_name' 2>/dev/null || true)
             case "$cand" in
               ""|*'{'*|*'}') cand="" ;;
             esac
-            ref="${cand:-main}"
+            if [ -z "$cand" ]; then
+              echo "::error::cannot resolve upstream latest release tag (no fallback to main)"
+              exit 1
+            fi
+            ref="$cand"
           fi
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
