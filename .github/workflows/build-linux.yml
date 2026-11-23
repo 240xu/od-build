@@ -461,7 +461,11 @@ jobs:
             gh release edit "$TAG" --repo "$REPO" \
               --title "OpenDesign Linux $VERSION" --notes "$notes"
             gh release upload "$TAG" dist/* --repo "$REPO" --clobber
-            echo "updated existing release $TAG"
+            # `gh release edit` 不会移动已有 tag。若不强制挪到本次构建的 commit，
+            # tag 会一直指着第一次创建时的 sha，与 notes 里声明的 build commit 不符。
+            gh api -X PATCH "repos/$REPO/git/refs/tags/$TAG" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            echo "updated existing release $TAG (tag moved to $GITHUB_SHA)"
           else
             # --target 固定到触发本次 run 的 commit：否则 tag 会指向创建时
             # 默认分支的 HEAD，可能与真正构建内容不符。
