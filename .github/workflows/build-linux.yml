@@ -46,10 +46,11 @@ on:
     types: [upstream-release]
 
 concurrency:
-  # 不带 event_name —— schedule 与 repository_dispatch 的 github.ref 都是
-  # refs/heads/main，若按事件名分组就不互斥，两个 run 会并行构建同一版本、
-  # 撞同一个 release tag（422 already_exists 或 --clobber 静默替换资产）。
-  group: od-linux-${{ github.ref }}
+  # 固定分组：不按 ref、也不按 event_name。schedule / repository_dispatch 的
+  # github.ref 都是 refs/heads/main，而从分支 workflow_dispatch 会落到另一个组，
+  # 那样两个 run 会并行构建同一版本、抢同一个 release tag。
+  # release tag 不含 namespace，所以所有 namespace 都必须串行。
+  group: od-linux-release
   cancel-in-progress: false
 
 env:
@@ -155,7 +156,8 @@ jobs:
           # 只有手动触发且显式 force=true 才跳过判重（用于修复已损坏的 release）。
           want="$tag"
           legacy="v${ver}-${ns}"
-          tags=$(gh api "repos/$REPO/releases?per_page=100" --jq '.[].tag_name' 2>/dev/null || true)
+          # --paginate：超过 100 个 release 之后，单页查不到老 tag 会重复构建。
+          tags=$(gh api --paginate "repos/$REPO/releases?per_page=100" --jq '.[].tag_name' 2>/dev/null || true)
           hit=0
           printf '%s\n' "$tags" | grep -Fxq "$want"   && hit=1
           printf '%s\n' "$tags" | grep -Fxq "$legacy" && hit=1
@@ -205,6 +207,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
+          # 两个 job 各装一遍依赖太慢，按 lockfile 命中 pnpm store
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -294,7 +299,7 @@ jobs:
         with:
           name: headless-${{ needs.resolve.outputs.ns }}
           path: dist/od-headless-${{ needs.resolve.outputs.ns }}.tar.gz
-          retention-days: 30
+          retention-days: 7
           if-no-files-found: error
 
   desktop:
@@ -332,6 +337,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
+          # 两个 job 各装一遍依赖太慢，按 lockfile 命中 pnpm store
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -399,18 +407,28 @@ jobs:
         with:
           name: desktop-${{ needs.resolve.outputs.ns }}
           path: dist/*.AppImage
-          retention-days: 30
+          retention-days: 7
           if-no-files-found: error
 
   release:
     name: Publish release
     needs: [resolve, headless, desktop]
-    # 只有两个目标**都**成功才发布 —— 否则 release 会缺件，违背「两种产物」的承诺。
+    # 只发布本次**被请求**且成功的目标：
+    #   请求了 headless  → headless.result 必须 success
+    #   没请求 headless  → headless.result 是 skipped，视为通过
+    # 被 job 级 if 跳过的 job，result 是 'skipped' 而不是 'success'，
+    # 所以不能再用「两者都 success」，否则单目标构建永远发不出 release。
     if: |
       !cancelled() &&
       needs.resolve.outputs.should_build == 'true' &&
-      needs.headless.result == 'success' &&
-      needs.desktop.result == 'success'
+      (
+        (needs.resolve.outputs.headless == 'true' && needs.headless.result == 'success') ||
+        needs.resolve.outputs.headless != 'true'
+      ) &&
+      (
+        (needs.resolve.outputs.desktop == 'true' && needs.desktop.result == 'success') ||
+        needs.resolve.outputs.desktop != 'true'
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -423,6 +441,16 @@ jobs:
 
       - name: List
         run: ls -lh dist/
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob
+          files=(./*.tar.gz ./*.AppImage)
+          [ "${#files[@]}" -ge 1 ] || { echo "no release assets in dist"; exit 1; }
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create or update release
         env:
@@ -441,6 +469,7 @@ jobs:
           OpenDesign Linux build for upstream \`$REF\` (version $VERSION).
 
           Build harness commit: \`$GITHUB_SHA\`
+          Built at: \`$(date -u '+%Y-%m-%dT%H:%M:%SZ')\`
 
           | asset | contents |
           |---|---|
@@ -461,11 +490,11 @@ jobs:
             gh release edit "$TAG" --repo "$REPO" \
               --title "OpenDesign Linux $VERSION" --notes "$notes"
             gh release upload "$TAG" dist/* --repo "$REPO" --clobber
-            # `gh release edit` 不会移动已有 tag。若不强制挪到本次构建的 commit，
-            # tag 会一直指着第一次创建时的 sha，与 notes 里声明的 build commit 不符。
-            gh api -X PATCH "repos/$REPO/git/refs/tags/$TAG" \
-              -f sha="$GITHUB_SHA" -F force=true >/dev/null
-            echo "updated existing release $TAG (tag moved to $GITHUB_SHA)"
+            # 不移动已有 tag：tag 必须始终对应当初创建它的那个 harness commit。
+            # 重建只做两件事——替换同名资产、刷新 notes（notes 里记录了本次
+            # harness sha 与 Built at）。否则 `v<ver>` 会从「上游源码版本」变成
+            # 「某次构建的提交」，以后想用 tag 回溯上游代码就对不上。
+            echo "updated existing release $TAG (assets clobbered, tag left at its original commit)"
           else
             # --target 固定到触发本次 run 的 commit：否则 tag 会指向创建时
             # 默认分支的 HEAD，可能与真正构建内容不符。
@@ -474,3 +503,4 @@ jobs:
               --title "OpenDesign Linux $VERSION" --notes "$notes"
             echo "created release $TAG (target=$GITHUB_SHA)"
           fi
+
