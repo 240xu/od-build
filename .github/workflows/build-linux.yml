@@ -214,13 +214,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # 促销弹窗抑制：三个营销表面（What's New / 模型促销 / 邀请横幅）都挂
-      # pointer-events:auto 的全屏遮罩，会把 composer 与 rail toggle 盖住。
-      # 上游自己的 e2e helper 就用「预置 localStorage」规避同一个问题，这里
-      # 在构建前从源码层面永久关掉。锚点匹配失败只告警、不失败构建。
-      - name: Patch promo surfaces (suppress marketing popups)
-        run: python3 .ci/scripts/patch-promo-suppress.py "$PWD"
-
       - name: Build web static export
         run: pnpm --filter @open-design/web build
 
@@ -350,13 +343,6 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      # 促销弹窗抑制：三个营销表面（What's New / 模型促销 / 邀请横幅）都挂
-      # pointer-events:auto 的全屏遮罩，会把 composer 与 rail toggle 盖住。
-      # 上游自己的 e2e helper 就用「预置 localStorage」规避同一个问题，这里
-      # 在构建前从源码层面永久关掉。锚点匹配失败只告警、不失败构建。
-      - name: Patch promo surfaces (suppress marketing popups)
-        run: python3 .ci/scripts/patch-promo-suppress.py "$PWD"
 
       - name: Build web static export
         run: pnpm --filter @open-design/web build

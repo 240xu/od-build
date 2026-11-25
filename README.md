@@ -34,24 +34,6 @@ tag 领先 13 个）。早期版本回退 `main` 的后果是：release 标着 `
 想用 `main` 的新修复，**必须显式传** `upstream_ref=main`；此时产物 tag 会自动带
 `-main.<sha7>` 后缀（如 `v0.27.3-main.a1b2c3d`），便于溯源。
 
-## 构建期的源码补丁
-
-`scripts/patch-promo-suppress.py` 在 `Build web static export` **之前**运行，
-从源码层面关掉两个营销弹窗：
-
-| 补丁点 | 改什么 | 原因 |
-|---|---|---|
-| `apps/web/src/lib/whats-new.ts` | `resolveWhatsNewPrompt` 恒返回 `'none'` | 更新弹窗挂 `pointer-events:auto` 全屏遮罩，盖住 composer |
-| `apps/web/src/components/DeepSeekV4FlashCampaign.tsx` | `hasSeenCampaign` 恒返回 `true` | 模型促销弹窗同上 |
-
-上游自己的 e2e helper（`e2e/lib/playwright/campaign-dismissals.ts`）用预置 localStorage
-规避同一问题，注释原文：*"Marketing campaign modals must never interrupt functional
-UI specs ... stealing focus and burying the elements a spec is about to interact with."*
-本 patch 把同一思路前移到构建期，让每个 bundle 出厂即静默。
-
-**锚点漂移不失败构建**：上游重构导致 anchor 匹配不到时，脚本打 `SKIP` 告警并继续，
-结果是「促销又出现」，不会产出坏包。
-
 ## 构建期已知坑（都已处理）
 
 1. **`--containerized` 不可用。** 官方 `buildDockerArgs` 不把 `CI` 传进容器，
