@@ -287,6 +287,11 @@ jobs:
           cp -a "$nsdir/resources" "$stage/out/linux/namespaces/$NS/"
           cp -a "dist/launcher/open-design-headless-$NS" "$stage/launcher/"
           python3 .ci/scripts/make-readme.py "$NS" "$stage/README.md"
+          # 随包附带运维补丁：这两条 nginx 修正缺一不可，且都会在升级后
+          # 需要重新确认。放在 bundle 里，解包即可拿到，不必回仓库翻文档。
+          mkdir -p "$stage/docs/nginx"
+          cp .ci/examples/nginx/od-headless.conf "$stage/docs/nginx/od-headless.conf"
+          cp .ci/docs/UPSTREAM-LIMITATIONS.md "$stage/docs/UPSTREAM-LIMITATIONS.md"
           tar -C "$stage" -czf "dist/od-headless-$NS.tar.gz" .
           ls -lh dist/
 
